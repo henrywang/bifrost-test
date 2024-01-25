@@ -1,47 +1,67 @@
 ---
-- hosts: localhost
+- hosts: cloud
   gather_facts: false
   become: false
   vars:
     platform: "openstack"
     test_os: "rhel-9-4"
     ssh_key_pub: ""
-    ssh_key_pub_file: ""
-    ansible_python_interpreter: /usr/bin/python3
-    ansible_connection: local
+    inventory_file: ""
     cloud_profile: "rhos-01"
+    images:
+      rhel-9-4: RHEL-9.4.0-x86_64-nightly-latest
+      centos-stream-9: edge-centos-stream-9
+    image_family:
+      centos-stream-9: centos-stream-9
+    image_project:
+      centos-stream-9: centos-cloud
 
   tasks:
     - set_fact:
         random_num: "{{ 9999 | random(start=1001) }}"
     - set_fact:
-        instance_name: "bifrost-{{ platform }}-{{ test_os }}-{{ random_num }}"
+        instance_name: "bootc-{{ platform }}-{{ test_os }}-{{ random_num }}"
 
     - name: Deploy runner on openstack
       block:
-        - name: Deploy RHEL instance
+        - name: create a new openstack keypair
+          openstack.cloud.keypair:
+            cloud: "{{ cloud_profile }}"
+            state: present
+            name: "kp-bootc-{{ random_num }}"
+            public_key_file: "{{ ssh_key_pub }}"
+
+        - name: create security group
+          openstack.cloud.security_group:
+            cloud: "{{ cloud_profile }}"
+            name: "sg-bootc-{{ random_num }}"
+            state: present
+            description: "security group for bootc test on {{ test_os }}"
+
+        - name: set ssh rule for security group
+          openstack.cloud.security_group_rule:
+            cloud: "{{ cloud_profile }}"
+            security_group: "sg-bootc-{{ random_num }}"
+            protocol: tcp
+            port_range_min: 22
+            port_range_max: 22
+            remote_ip_prefix: 0.0.0.0/0
+
+        - name: Deploy openstack instance
           openstack.cloud.server:
             cloud: "{{ cloud_profile }}"
             name: "{{ instance_name }}"
-            image: "edge-fedora-39"
+            image: "{{ images[test_os] }}"
             flavor: "ci.standard.small"
             network: "shared_net_9"
-            key_name: "rhel-edge"
-            security_groups: ssh_only
+            key_name: "kp-bootc-{{ random_num }}"
+            security_groups: "sg-bootc-{{ random_num }}"
             auto_ip: true
             config_drive: true
             wait: true
             timeout: 600
             userdata: |
               #cloud-config
-              users:
-                - default
-                - name: admin
-                  gecos: Administrator
-                  groups: users,wheel
-                  sudo: ALL=(ALL) NOPASSWD:ALL
-                  ssh_authorized_keys:
-                    - "{{ ssh_key_pub }}"
               packages:
                 - python3
                 - python3-dnf
@@ -63,16 +83,19 @@
     - name: Deploy runner on Google Cloud
       block:
         - name: gcloud/gsutil - authorizing with a service account
-          command: 
+          command:
             /usr/bin/gcloud auth activate-service-account \
             --key-file="{{ lookup('env', 'GCP_SERVICE_ACCOUNT_FILE') }}"
 
-        - name: create gcp key file
-          copy:
-            dest: "{{ playbook_dir }}/gcp_key"
-            content: "admin:{{ ssh_key_pub }}"
+        - name: Create gcp key file
+          shell: sed "s/ssh-rsa/cloud-user:ssh-rsa/" "{{ ssh_key_pub }}" > "{{ playbook_dir }}/gcp_key"
+          when: "'centos' in test_os"
 
-        - name: create gcp instance
+        - set_fact:
+            image_args: "--image-family={{ image_family[test_os] }} --image-project={{ image_project[test_os] }}"
+          when: "'centos' in test_os"
+
+        - name: Create gcp instance
           command:
             "/usr/bin/gcloud compute instances create {{ instance_name }} \
             --zone=us-central1-a \
@@ -83,8 +106,7 @@
             --metadata-from-file=ssh-keys={{ playbook_dir }}/gcp_key \
             --metadata=block-project-ssh-keys=TRUE \
             --provisioning-model=SPOT \
-            --image-family=centos-stream-9 \
-            --image-project=centos-cloud \
+            {{ image_args }} \
             --service-account={{ lookup('env', 'GCP_SERVICE_ACCOUNT_NAME') }} \
             --project={{ lookup('env', 'GCP_PROJECT') }} \
             --format=json"
@@ -108,25 +130,7 @@
       add_host:
         name: "{{ instance_ip }}"
         groups: guest
-        runner_name: "{{ instance_name }}"
 
-    # # Dev enviornment needs this setting
-    # - name: set private key permisson to 600
-    #   file:
-    #     path: key/ostree_key
-    #     mode: "0600"
-
-- hosts: guest
-  gather_facts: true
-  become: false
-  vars:
-    ansible_python_interpreter: /usr/bin/python3
-    ansible_user: admin
-    ansible_private_key_file: "{{ playbook_dir }}/key/ostree_key"
-    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-    hide_sensitive_logs: true
-
-  tasks:
     - name: Ensure cloud-init has finished
       raw: test -f /var/lib/cloud/instance/boot-finished
       retries: 30
@@ -134,6 +138,7 @@
       register: cloud_init_check
       changed_when: false
       until: cloud_init_check is success
+      delegate_to: "{{ instance_ip }}"
       when: platform == "openstack"
 
     - name: Wait 10 seconds for gcp instance
@@ -142,6 +147,35 @@
       delegate_to: localhost
       when: platform == "gcp"
 
+    - name: Write instance ip to inventory file
+      community.general.ini_file:
+        path: "{{ inventory_file }}"
+        section: guest
+        option: guest ansible_host
+        value: "{{ instance_ip }}"
+        no_extra_spaces: true
+
+    - name: Write random number to inventory file
+      community.general.ini_file:
+        path: "{{ inventory_file }}"
+        section: cloud:vars
+        option: random_num
+        value: "{{ random_num }}"
+        no_extra_spaces: true
+
+    - name: Write instance name to inventory file
+      community.general.ini_file:
+        path: "{{ inventory_file }}"
+        section: cloud:vars
+        option: instance_name
+        value: "{{ instance_name }}"
+        no_extra_spaces: true
+
+- hosts: guest
+  gather_facts: false
+  become: false
+
+  tasks:
     - name: Install podman and skopeo
       package:
         name:
@@ -159,12 +193,13 @@
          -v /:/target \
          --security-opt label=type:unconfined_t \
          {{ test_image_url }} \
-         bootc install to-filesystem --karg=console=ttyS0,115200n8 --replace=alongside /target"
+         bootc install to-filesystem --replace=alongside /target"
+      become: true
 
-    - name: reboot to deploy new ostree commit
+    - name: Reboot to deploy new system
       reboot:
       become: true
 
-    - name: wait for connection to become reachable/usable
+    - name: Wait for connection to become reachable/usable
       wait_for_connection:
       delay: 30
